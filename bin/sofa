@@ -80,7 +80,7 @@ if __name__ == "__main__":
     parser.add_argument('--enable_aisi', dest='enable_aisi', action='store_true')
     parser.set_defaults(enable_aisi=False)
     parser.add_argument('--enable_strace', dest='enable_strace', action='store_true')
-    parser.set_defaults(enable_strace=False)
+    parser.set_defaults(enable_strace=True)
     parser.add_argument('--aisi_via_strace', dest='aisi_via_strace', action='store_true')
     parser.set_defaults(aisi_via_strace=False)
     parser.add_argument('--display_swarms', dest='display_swarms', action='store_true')

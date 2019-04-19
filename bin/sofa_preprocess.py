@@ -1210,7 +1210,9 @@ def sofa_preprocess(cfg):
             print_info(cfg,"Length of straces = %d" % len(lines))
             if len(lines) > 1:
                 strace_list = []
-                strace_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())               
+                strace_list.append(np.empty((len(sofa_fieldnames), 0)).tolist()) 
+                write_cnt = 0
+                read_cnt = 0              
                 for i in range(len(lines)):
                     if i % cfg.plot_ratio > 0:
                         continue
@@ -1232,12 +1234,19 @@ def sofa_preprocess(cfg):
                     else:
                         tid = pid
                         t_begin = float(fields[1])
-                        strace_info = ''.join(fields[1:-3])
-                    
+                        strace_info = ''.join(fields[2:-3])
+
                     if not cfg.absolute_timestamp:
                         t_begin = t_begin - cfg.time_base
                     
-                    #strace_info = strace_info.split('(')[0] 
+                    strace_info = strace_info.split('(')[0] 
+
+                    #counting    
+                    if fields[2].find('write') != -1:
+                        write_cnt = write_cnt + 1
+                    elif fields[2].find('read') != -1:
+                        read_cnt = read_cnt + 1
+
                     try:
                         duration = float(fields[-1].split('<')[1].split('>')[0]) 
                     except:
@@ -1270,8 +1279,14 @@ def sofa_preprocess(cfg):
                     strace_list.append(trace)
                 
                 print_info(cfg, 'strace.txt reading is done.')
+                
                 if len(strace_list)>1:
-                    strace_traces = list_to_csv_and_traces(logdir, strace_list, 'strace.csv', 'w')
+                    trace_data = []
+                    #strace_traces = list_to_csv_and_traces(logdir, strace_list, 'strace.csv', 'w')
+                    trace_data = list_to_csv_and_traces(logdir, strace_list, 'strace.csv', 'w')
+                    strace_traces = trace_data[(trace_data['name'] == 'write')|(trace_data['name'] == 'read')]
+                    #print(strace_traces)
+                    
     print_info(cfg,'Total strace duration: %.3lf' % total_strace_duration)
 
     # Time synchronization among BIOS Time (e.g. used by perf)  and NTP Time (e.g. NVPROF, tcpdump, etc.)

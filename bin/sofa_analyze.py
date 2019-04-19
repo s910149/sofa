@@ -11,6 +11,7 @@ from operator import attrgetter, itemgetter
 import networkx as nx
 import numpy as np
 import pandas as pd
+import requests
 import time
 from sofa_aisi import *
 from sofa_common import *
@@ -18,41 +19,6 @@ from sofa_config import *
 from sofa_hsg import *
 from sofa_print import *
 
-import grpc
-import potato_pb2
-import potato_pb2_grpc
-import socket
-
-# input: pfv(performance feature vector), Pandas.DataFrame
-# output: hint, docker_image  
-def get_hint(features):
-
-    if len(features) > 0:
-        pfv = potato_pb2.PerformanceFeatureVector() 
-        for i in range(len(features)):
-            name = features.iloc[i]['name']
-            value = features.iloc[i]['value']
-            print('%s%s%s' % (str(i).ljust(10), name.ljust(30), ('%.3lf'%value).ljust(20)))
-            pfv.name.append(name)
-            pfv.value.append(value)
-			
-        print('Wait for response from POTATO server...')
-        myhostname = socket.gethostname()
-        channel = grpc.insecure_channel('localhost:50051')
-        stub = potato_pb2_grpc.HintStub(channel)
-        request = potato_pb2.HintRequest( hostname = myhostname,
-                                          pfv = pfv) 
-        response = stub.Hint(request)
-        hint = response.hint 
-        docker_image = response.docker_image
-    else:
-        hint = 'There is no pfv to get hints.' 
-        docker_image = 'NA' 
-
-    print(hint)
-    print(docker_image) 
-    return hint, docker_image 
-     
 
 def payload_sum(df):
     print((len(df)))
@@ -69,58 +35,73 @@ class Event:
         return repr((self.name, self.ttype, self.timestamp, self.duration))
 
 
+def strace_profile(logdir, cfg, df_strace):
+    print_title("Strace Profiling")
+    groups = df_strace.groupby("name")
+    write_cnt = []
+    write_cnt = groups.get_group('write')
+    read_cnt = []
+    read_cnt = groups.get_group('read')
+    print('name\tcount')
+    print('write()\t%d'%len(write_cnt))
+    print('read()\t%d'%len(read_cnt))
+    print('Detail for write():')
+    print(write_cnt)
+    print()
+    print('Detail for read():')
+    print(read_cnt)
+    return 0
+
 def gpu_profile(logdir, cfg, df_gpu, features):
     print_title("GPU Profiling")
     print('Per-GPU time (s):')
     groups = df_gpu.groupby("deviceId")["duration"]
-    gpu_time = 0
+    total_gpu_time = 0
     for key, item in groups:
         gpuid = int(float(key))
         per_gpu_time = groups.get_group(key).sum()
         print("[%d]: %lf" % (gpuid, per_gpu_time))
-        gpu_time = gpu_time + per_gpu_time 
+        total_gpu_time = total_gpu_time + per_gpu_time 
     n_gpus = len(groups)
-    print(("Total GPU time of all GPUs (s) = %.3lf" % gpu_time))
+    mean_gpu_time = total_gpu_time / n_gpus
+    print(("Total GPU time of all GPUs (s) = %.3lf" % total_gpu_time))
+    print(("Mean per-GPU time of all GPUs (s) = %.3lf" % mean_gpu_time))
    
-    kernel_time = 0
+    total_kernel_time = 0
     grouped_df = df_gpu.groupby("copyKind")["duration"]
     for key, item in grouped_df:
         if key == 0:
-            kernel_time = grouped_df.get_group(key).sum()
+            total_kernel_time = grouped_df.get_group(key).sum()
 
-    nccl_time = 0
+    all_reduce_time = 0
     grouped_df = df_gpu.groupby("name")["duration"]
     for key, item in grouped_df:
         #print("[%s]: %lf" % (key, grouped_df.get_group(key).sum()))
-        if key.find("nccl") != -1:
-            nccl_time = nccl_time + grouped_df.get_group(key).sum()
+        if key.find("AllReduce") != -1:
+            all_reduce_time = all_reduce_time + grouped_df.get_group(key).sum()
 
     features = comm_profile(logdir, cfg, df_gpu, features)
 
     get_top_k_events(df_gpu, 10)
-    df = pd.DataFrame({'name':['gpu_time', 'num_gpus', 'kernel_time', 'nccl_time'], 
-                        'value':[gpu_time, n_gpus, kernel_time, nccl_time] }, 
+    df = pd.DataFrame({ 'name':['total_gpu_time', 'mean_gpu_time', 'total_kernel_time', 'all_reduce_time'], 
+                        'value':[total_gpu_time, mean_gpu_time, total_kernel_time, all_reduce_time] }, 
                         columns=['name','value'])
     features = pd.concat([features, df])
     return features
 
-def net_profile(logdir, cfg, df, features):
+def net_profile(logdir, cfg, df):
     print_title("Network Profiling:")
     grouped_df = df.groupby("name")["duration"]
-    net_time = 0
+    total_net_time = 0
     n_packets = 0
     for key, item in grouped_df:
         #print("[%s]: %lf" % (key, grouped_df.get_group(key).sum()))
         if key.find("network:tcp:") != -1:
-            net_time = net_time + grouped_df.get_group(key).sum()
+            total_net_time = total_net_time + grouped_df.get_group(key).sum()
             n_packets = n_packets + 1
-    print(("total network time (s) = %.3lf" % net_time))
+    print(("total network time (s) = %.3lf" % total_net_time))
     print(("total amount of network packets  = %d" % n_packets))
-    df = pd.DataFrame({'name':['net_time'], 
-                        'value':[net_time] }, 
-                        columns=['name','value'])
-    features = pd.concat([features, df])
-    return features
+
 
 def cpu_profile(logdir, cfg, df):
     print_title("CPU Profiling:")
@@ -140,7 +121,79 @@ def cpu_profile(logdir, cfg, df):
     cpu_detail_profile_df = cpu_detail_profile_df[['timestamp','ratio(%)','duration','name']]
     print(cpu_detail_profile_df[:20].to_string(index=False))
 
-def vmstat_profile(logdir, cfg, df, features):
+def potato_submit(cfg, data_in):
+    headers = {'Content-type': 'application/json'}
+    url = cfg.potato_server+'/metric/' + data_in['name']
+    data_json = json.dumps(data_in)
+    response = requests.delete(url, data=data_json, headers=headers)
+    response = requests.post(url, data=data_json, headers=headers)
+    response = requests.get(url, data=data_json, headers=headers)
+    print('SUBMIT %s: %.3lf ' % ( data_in['name'], float(response.json()['value'])))
+
+def potato_client(logdir, cfg, df_cpu, df_gpu, df_vmstat, iter_summary):
+    print_title("POTATO Client")
+    grouped_df = df_cpu.groupby("deviceId")["duration"]
+    cpu_time = 0.0
+    for key, item in grouped_df:
+        if cfg.verbose:
+            print(("[%d]: %lf" % (key, grouped_df.get_group(key).sum())))
+        cpu_time = cpu_time + grouped_df.get_group(key).sum()
+    n_devices = len(grouped_df)
+    avg_cpu_time = cpu_time / n_devices
+    data = {'name' : 'avg_cpu_time', 'unit':'s', 'value': avg_cpu_time }
+    potato_submit(cfg, data)
+
+    #return {'elapsed_time': elapsed_time, 'fw_time': fw_time, 'bw_time': bw_time, 'kernel_time': kernel_time, 'payload': payload, 'copy_time':copy_time, 'gpu_time':gpu_time, 'gemm_time':gemm_time, 'streams':streams}
+    if len(iter_summary) > 0:
+       print('mean: ', iter_summary['elapsed_time'].mean())
+       step_time = scipy.stats.gmean(iter_summary['elapsed_time'])
+       if cfg.num_iterations > 1:
+           step_time = scipy.stats.gmean(iter_summary['elapsed_time'].iloc[1:])
+       fw_time = iter_summary['fw_time'].mean()
+       bw_time = iter_summary['bw_time'].mean()
+       copy_time = iter_summary['copy_time'].mean()
+       gpu_time = iter_summary['gpu_time'].mean()
+       gemm_time = iter_summary['gemm_time'].mean()
+       kernel_time = gpu_time - copy_time
+       payload = iter_summary['payload'].mean()
+       streams = iter_summary['streams'].mean()
+
+       print_title('Upload performance data to POTATO server')
+       data = {'name' : 'step_time', 'unit':'s', 'value': step_time }
+       potato_submit(cfg, data)
+       data = {'name' : 'copy_time', 'unit':'s', 'value': copy_time }
+       potato_submit(cfg, data)
+       #TODO: remove it
+       data = {'name' : 'payload_h2d', 'unit':'B', 'value': payload/2 }
+       data = {'name' : 'payload_d2h', 'unit':'B', 'value': payload/2 }
+       potato_submit(cfg, data)
+
+       #data = {'name' : 'kernel_time', 'unit':'s', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'h2d_time', 'unit':'s', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'd2h_time', 'unit':'s', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'p2p_time', 'unit':'s', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'h2d_payload', 'unit':'B', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'd2h_payload', 'unit':'B', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'p2p_payload', 'unit':'B', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'h2d_bw', 'unit':'GBps', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'd2h_bw', 'unit':'GBps', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'd2d_bw', 'unit':'GBps', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data = {'name' : 'p2p_bw', 'unit':'GBps', 'value': total_exec_time }
+       #potato_submit(cfg, data)
+       #data_json = json.dumps(data)
+    #print('cpu_time: %.3lf (%s)' % (r.json()['value'], r.json()['unit']))
+
+def vmstat_profile(logdir, cfg, df):
     print_title("VMSTAT Profiling:")
     df_name = df['name']
 
@@ -167,13 +220,14 @@ def vmstat_profile(logdir, cfg, df, features):
     print('mean of vmstat wa (%%): %.2lf' % vmstat_traces['wa'].mean())
 
 def mpstat_topdown(cfg, df_mpstat, features):
+    
 
     return features
 
 def mpstat_profile(logdir, cfg, df, features):
     print_title("MPSTAT Profiling:")
-    num_cores = int(df['deviceId'].max() + 1)
-    df_summary = pd.DataFrame( np.zeros((num_cores,5)), columns=['USR','SYS','IDL','IOW','IRQ'])
+    n_cores = int(df['deviceId'].max() + 1)
+    df_summary = pd.DataFrame( np.zeros((n_cores,5)), columns=['USR','SYS','IDL','IOW','IRQ'])
     for i in range(len(df)):
         dt = df.iloc[i]['duration']
         core = int(df.iloc[i]['deviceId'])
@@ -218,12 +272,12 @@ def mpstat_profile(logdir, cfg, df, features):
                                                 df_summary.iloc[i]['IOW'],
                                                 df_summary.iloc[i]['IRQ'] ))
 
-    total_cpu_time = df_summary[['USR','SYS','IRQ']].sum().sum()
+    total_cpu_time = df_summary[['USR','SYS','IOW','IRQ']].sum().sum()
     print('Active CPU Time (s): %.3lf' % total_cpu_time) 
-    active_cpu_ratio = int(100*total_cpu_time / (num_cores*cfg.elapsed_time))
+    active_cpu_ratio = int(100*total_cpu_time / (n_cores*cfg.elapsed_time))
     print('Active CPU ratio (%%): %3d' % active_cpu_ratio)
-    df_feature = pd.DataFrame({ 'name':['num_cores', 'active_cpu_ratio'], 
-                        'value':[num_cores, active_cpu_ratio] }, 
+    df_feature = pd.DataFrame({ 'name':['active_cpu_ratio'], 
+                        'value':[active_cpu_ratio] }, 
                         columns=['name','value'])
     features = pd.concat([features, df_feature])   
     return features
@@ -340,6 +394,7 @@ def sofa_analyze(cfg):
     # Construct Performance Features
     features = pd.DataFrame({'name':['elapsed_time'], 'value':[cfg.elapsed_time]}, columns=['name','value'])
     
+    
     try:
         df_cpu = pd.read_csv(filein_cpu)
         cpu_profile(logdir, cfg, df_cpu)
@@ -349,20 +404,21 @@ def sofa_analyze(cfg):
 
     try:
         df_strace = pd.read_csv(filein_strace)
+        strace_profile(logdir, cfg, df_strace)
     except IOError as e:
         df_strace = pd.DataFrame([], columns=cfg.columns)
         print_warning("%s is not found" % filein_strace)
 
     try:
         df_net = pd.read_csv(filein_net)
-        features = net_profile(logdir, cfg, df_net, features)
+        net_profile(logdir, cfg, df_net)
     except IOError as e:
         df_net = pd.DataFrame([], columns=cfg.columns)
         print_warning("%s is not found" % filein_net)
 
     try:
         df_vmstat = pd.read_csv(filein_vmstat)
-        features = vmstat_profile(logdir, cfg, df_vmstat, features)
+        vmstat_profile(logdir, cfg, df_vmstat)
     except IOError as e:
         df_vmstat = pd.DataFrame([], columns=cfg.columns)
         print_warning("%s is not found" % filein_vmstat)
@@ -386,17 +442,20 @@ def sofa_analyze(cfg):
                     
     print_title('Final Performance Features')
     print('%s%s%s' % ('ID'.ljust(10),'Feature'.ljust(30),'Value'.ljust(20)) )
-    
     for i in range(len(features)):
         name = features.iloc[i]['name']
         value = features.iloc[i]['value']
         print('%s%s%s' % (str(i).ljust(10), name.ljust(30), ('%.3lf'%value).ljust(20)))
 
     if cfg.potato_server:
+        potato_client(logdir, cfg, df_cpu, df_gpu, df_vmstat, iter_summary)
         print_title('POTATO Feedback')
-        hint, docker_image = get_hint(features)
-        print('Optimization hints: ' + hint)
-        print('Tag of optimal image recommended from POTATO: ' + highlight(docker_image))
+        r = requests.get(cfg.potato_server+'/image/best')
+        
+        print('Tag of optimal image recommended from POTATO: '+ highlight(r.json()['tag']))
+        print('Estimated speedup: %.2lfx' % r.json()['score'] )
+        print('Optimization action: '+r.json()['description'])
         print('Please re-launch KubeFlow Jupyter-notebook with the new tag.')
-    
+    #print_warning('Something wrong with POTATO client')
+
     print('\n\n')

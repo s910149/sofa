@@ -30,7 +30,7 @@ class SOFA_Config:
     logdir = './sofalog/'
     base_logdir = ''
     match_logdir = ''
-    enable_vmstat = False
+    enable_vmstat = True
     enable_mpstat = True
     enable_diskstat = True
     enable_pcm = False
@@ -39,8 +39,8 @@ class SOFA_Config:
     potato_server = None
     elapsed_time = 0
     absolute_timestamp = False
-    time_base = 0
+    time_base = 5
     pid = -1
     timeout = 30
     columns = ['timestamp', 'duration']
-    enable_strace = False
+    enable_strace = True

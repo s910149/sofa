@@ -90,7 +90,7 @@ def comm_profile(logdir, cfg, df_gpu, features):
     for key, item in groups:
         if key == 1 or key == 2 or key == 8 or key == 10 :
             bw_table[key] = groups.get_group(key).mean()
-            print('%s : %.2lf (GB/s)' % (cktable[key], bw_table[key]))
+            print('%s : %.2lf (gb/s)' % (cktable[key], bw_table[key]))
 
     print("\n=========== Duration report for large data-copy (64kb+) =======")
     h2d_bandwidth = d2h_bandwidth = d2d_bandwidth = p2p_bandwidth = 16
@@ -169,7 +169,7 @@ def comm_profile(logdir, cfg, df_gpu, features):
             "payload",
             "bandwidth"])
     
-    df = pd.DataFrame({ 'name':['h2d_payload', 'd2h_payload', 'd2d_payload', 'p2p_payload', 
+    df = pd.DataFrame({ 'name':['total_h2d_payload', 'total_d2h_payload', 'total_d2d_payload', 'total_p2p_payload', 
                                 'h2d_bandwidth', 'd2h_bandwidth', 'd2d_bandwidth', 'p2p_bandwidth', 
                                 'h2d_time', 'd2h_time', 'd2d_time', 'p2p_time'], 
                         'value':[ payload_table[1], payload_table[2], payload_table[8], payload_table[10], 
